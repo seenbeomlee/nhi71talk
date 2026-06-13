@@ -6,7 +6,7 @@ from chatbot import handle_webhook
 app = FastAPI(title="일정 챗봇")
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok"}
 
