@@ -1,10 +1,12 @@
 /**
- * NHI71 Gomoku Bot
+ * NHI71 Gomoku Bot (Renju Rules)
  *
- * Usage: Paste into Chrome DevTools > Sources > Snippets and run with Cmd+Enter
- * The bot automatically clicks the black button and plays optimal moves.
+ * Rules:
+ *   Black (first player): 3-3, 4-4, overline(6+) are forbidden moves
+ *   White (second player): no restrictions
  *
- * Stop: window._botRunning = false
+ * Usage: Chrome DevTools > Sources > Snippets > Cmd+Enter
+ * Stop:  window._botRunning = false
  */
 
 window._botRunning = false;
@@ -36,13 +38,79 @@ function getH() {
 function getRoomId() { return location.pathname.split('/').pop(); }
 function inBounds(r, c) { return r >= 0 && r < SIZE && c >= 0 && c < SIZE; }
 
-// --- AI ---
+// --- Line counting ---
 
 function countLine(board, r, c, dr, dc, color) {
   var cnt = 0, nr = r + dr, nc = c + dc;
   while (inBounds(nr, nc) && board[nr][nc] === color) { cnt++; nr += dr; nc += dc; }
   return { cnt: cnt, open: inBounds(nr, nc) && board[nr][nc] === null };
 }
+
+// Count consecutive stones including [r][c] in one axis (both directions)
+function lineLength(board, r, c, dr, dc, color) {
+  var f = countLine(board, r, c, dr, dc, color);
+  var b = countLine(board, r, c, -dr, -dc, color);
+  return { total: f.cnt + b.cnt + 1, fOpen: f.open, bOpen: b.open };
+}
+
+// --- Renju forbidden move detection (black only) ---
+
+// Count how many "fours" placing at [r][c] creates
+function countFours(board, r, c, color) {
+  var count = 0;
+  for (var i = 0; i < DIRS.length; i++) {
+    var dr = DIRS[i][0], dc = DIRS[i][1];
+    var ln = lineLength(board, r, c, dr, dc, color);
+    if (ln.total === 4 && (ln.fOpen || ln.bOpen)) { count++; }
+    // Broken four: _OO_O_ or _O_OO_ pattern
+    // Check if skipping one gap in direction gives 4-in-row
+    if (ln.total === 3) {
+      var nr = r + (countLine(board, r, c, dr, dc, color).cnt + 1) * dr;
+      var nc = c + (countLine(board, r, c, dr, dc, color).cnt + 1) * dc;
+      if (inBounds(nr, nc) && board[nr][nc] === null) {
+        var beyond = countLine(board, nr, nc, dr, dc, color);
+        if (beyond.cnt >= 1) { count++; }
+      }
+    }
+  }
+  return count;
+}
+
+// Count how many "open threes" placing at [r][c] creates
+function countOpenThrees(board, r, c, color) {
+  var count = 0;
+  for (var i = 0; i < DIRS.length; i++) {
+    var dr = DIRS[i][0], dc = DIRS[i][1];
+    var ln = lineLength(board, r, c, dr, dc, color);
+    // Open three: exactly 3 in a row, both ends open
+    if (ln.total === 3 && ln.fOpen && ln.bOpen) { count++; }
+  }
+  return count;
+}
+
+// Returns true if placing black at [r][c] is a forbidden move
+function isForbidden(board, r, c) {
+  board[r][c] = 'black';
+
+  var forbidden = false;
+
+  // Overline (6 or more)
+  for (var i = 0; i < DIRS.length; i++) {
+    var ln = lineLength(board, r, c, DIRS[i][0], DIRS[i][1], 'black');
+    if (ln.total >= 6) { forbidden = true; break; }
+  }
+
+  // 4-4
+  if (!forbidden && countFours(board, r, c, 'black') >= 2) { forbidden = true; }
+
+  // 3-3
+  if (!forbidden && countOpenThrees(board, r, c, 'black') >= 2) { forbidden = true; }
+
+  board[r][c] = null;
+  return forbidden;
+}
+
+// --- AI scoring ---
 
 function scoreAt(board, r, c, color) {
   board[r][c] = color;
@@ -62,7 +130,7 @@ function scoreAt(board, r, c, color) {
   return score;
 }
 
-// Returns [row, col] of best move using attack/defense heuristic scoring
+// Returns [row, col] of best move, skipping forbidden moves for black
 function getBestMove(board, myColor, oppColor) {
   var cands = [], seen = {};
   for (var r = 0; r < SIZE; r++) {
@@ -82,21 +150,32 @@ function getBestMove(board, myColor, oppColor) {
     }
   }
   if (cands.length === 0) return [7, 7];
-  var best = -Infinity, move = [7, 7];
+
+  var best = -Infinity, move = null;
   for (var i = 0; i < cands.length; i++) {
     var cr = cands[i][0], cc = cands[i][1];
+
+    // Skip forbidden moves when playing black (Renju rules)
+    if (myColor === 'black' && isForbidden(board, cr, cc)) {
+      console.log('skip forbidden [' + cr + ',' + cc + ']');
+      continue;
+    }
+
     var s1 = scoreAt(board, cr, cc, myColor);
     var s2 = scoreAt(board, cr, cc, oppColor);
     var score = s1 > s2 ? s1 : s2;
     if (score > best) { best = score; move = [cr, cc]; }
   }
-  return move;
+
+  // Fallback: if all moves are forbidden (rare), pick any empty cell
+  if (!move) {
+    for (var i = 0; i < cands.length; i++) { move = cands[i]; break; }
+  }
+  return move || [7, 7];
 }
 
 // --- API ---
 
-// Submits a move via Supabase RPC.
-// p_x = col (horizontal), p_y = row (vertical)
 function makeMove(row, col) {
   var H = getH();
   if (!H) return Promise.resolve(false);
@@ -105,16 +184,15 @@ function makeMove(row, col) {
     headers: H,
     body: JSON.stringify({ p_room_id: getRoomId(), p_x: col, p_y: row })
   }).then(function(res) {
-    if (res.ok) { console.log('ok [' + row + ',' + col + ']'); return true; }
+    if (res.ok) { console.log('placed [' + row + ',' + col + ']'); return true; }
     return res.text().then(function(t) { console.error('fail ' + res.status + ' ' + t); return false; });
   });
 }
 
-// Finds and clicks the black (first player) button
+// Clicks the black (first player) button. 흑 = 흑
 function clickBlack() {
   var btns = Array.from(document.querySelectorAll('button'));
-  // 흥 = 흑 in Unicode
-  var btn = btns.find(function(b) { return b.textContent.indexOf('흥') !== -1; });
+  var btn = btns.find(function(b) { return b.textContent.indexOf('흑') !== -1; });
   if (btn) { btn.click(); window._myColor = 'black'; console.log('black selected'); return true; }
   return false;
 }
@@ -132,9 +210,8 @@ function botLoop() {
       var room = a[0];
       if (!room) { setTimeout(botLoop, 2000); return; }
 
-      // Game not started yet: try to click black button
       if (room.status !== 'playing') {
-        if (!clickBlack()) { console.log('waiting...'); }
+        if (!clickBlack()) { console.log('waiting for opponent...'); }
         setTimeout(botLoop, 1500);
         return;
       }
@@ -146,6 +223,7 @@ function botLoop() {
       var oppColor = myColor === 'black' ? 'white' : 'black';
 
       if (room.current_turn_color === myColor) {
+        console.log('my turn, calculating...');
         var move = getBestMove(room.board_state, myColor, oppColor);
         makeMove(move[0], move[1]).then(function() { setTimeout(botLoop, 1500); });
       } else {
@@ -156,5 +234,5 @@ function botLoop() {
 }
 
 window._botRunning = true;
-console.log('bot started - stop: window._botRunning = false');
+console.log('bot started (renju rules) - stop: window._botRunning = false');
 botLoop();
